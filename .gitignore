@@ -1,0 +1,3 @@
+# pycharm and python related ignores
+.idea
+__pycache__
