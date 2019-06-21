@@ -4,6 +4,7 @@ import nems.recording as recording
 import nems_lbhb.baphy as nb
 import nems_lbhb.io as nio
 from nems import epoch as ep
+import os
 
 import nems.preprocessing as preproc
 import nems.epoch as nep
@@ -22,127 +23,315 @@ import numpy as np
 import scipy.ndimage.filters as sf
 import scipy.signal as ssig
 import scipy as sp
+from scipy import ndimage as ndi
+import scipy.io as sio
 
 from cpp_parameter_handlers import _epoch_name_handler, _channel_handler, _fs_handler
 from nems.signal import PointProcess
 
 #rec['resp']._data ##calls data that is in signals
 
+#Sample input data
 mfilename = "/auto/data/daq/Amanita/AMT005/AMT005c05_p_TOR.m"
 cellid = 'AMT005c-12-1' #one being used in Matlab
 fs=1000
-rec = nb.baphy_load_recording_file(mfilename=mfilename, cellid=cellid,fs=fs, stim=False) #fs=1000
-globalparams, exptparams, exptevents = nio.baphy_parm_read(mfilename)
-signal = rec['resp'].rasterize(fs=fs)                                                         #rasterize the signal
+
+##############################################################################################################
+########################################SUBFUNCTIONS##########################################################
+##############################################################################################################
+##############STRF_EST_CORE###################################################################
+#Estimate STRF from TORCS:
+#
+#Inputs: stacked: spike raster, time (sound start to stop) x torcidx x repetition
+#        TorcObject: torc parameter structure
+#        fs: bin rate of stacked (stacked will be rebinned to match max sampling rate of torcs)
+#        INC1stCYCLE: (default 0) if 1, include first 250ms of stacked in STRF estimation (0 removes transient response)
+#        jackN: (default 0) if>1, compute jackknifes on strfest to measure error bars (half there at the moment)
+#
+#Output: strfest: frequency x time lag STRF (time bins match max sampling rate of torcs, usually 48Hz)
+#        snr: signal-to-noise of STRF estimate, usually >0.2 is something good
+#        stim: taken from ScaledTorcs (dict), stim collapses them all on a new dimension of the TORCS (easier to call in main fxn)
+#        strfee: empty array just like the strfest
+#        StimParams: a dict of some useful parameters for plotting
+
+def strf_est_core(stacked,TorcObject,exptparams,fs,INC1stCYCLE=0,jackN=0):
+
+    referencecount = TorcObject['MaxIndex']
+    TorcNames = exptparams["TrialObject"][1]["ReferenceHandle"][1]["Names"]
+    TorcKeys = exptparams["TrialObject"][1]["ReferenceHandle"][1].keys()
+    RefDuration = TorcObject['Duration']
+
+    numrecs = referencecount
+    mf = int(fs/1000)
+    stdur = int(RefDuration*1000)
+    ddur = int(RefDuration*1000)
+    stonset = 0
+
+    ###change nesting to TORCs(StimParam(...))
+    TorcParams = dict.fromkeys(TorcNames)                                                    #Create dict from TorcNames
+    all_freqs = list()                                                                       #Create empty list of freqs
+    all_velos = list()                                                                       #Create empty list of velos
+    all_hfreq = list()
+    all_lfreq = list()
+
+    for tt, torc in enumerate(TorcNames):                                                    #Number them
+        TorcParams[torc] = exptparams["TrialObject"][1]["ReferenceHandle"][1]["Params"][tt + 1]     #insert Params 1-30 to torcs 1-30 now TORCs(Params(...)) nested other way
+        freqs = TorcParams[torc]['Scales']                                                   #Add all TORCs' Scales value as var
+        velos = TorcParams[torc]['Rates']                                                    #Add all TORCs' Rates value as var
+        all_freqs.append(freqs)                                                              #
+        all_velos.append(velos)                                                              #
+        highestfreqs = TorcParams[torc]['HighestFrequency']
+        lowestfreqs = TorcParams[torc]['LowestFrequency']
+        all_hfreq.append(highestfreqs)
+        all_lfreq.append(lowestfreqs)
+
+    frqs = np.unique(np.concatenate(all_freqs))                                              #Smoosh to one array and output unique elements
+    vels = np.unique(np.concatenate(all_velos))                                              #temporal spectra
+    HighestFrequency = int(np.unique(all_hfreq))
+    LowestFrequency = int(np.unique(all_lfreq))
+    Octaves = np.log2(HighestFrequency/LowestFrequency)
+
+    StimParams = dict()
+    StimParams['lfreq'] = LowestFrequency
+    StimParams['hfreq'] = HighestFrequency
+    StimParams['octaves'] = int(Octaves)
+
+    Params = dict()
+    N = np.size(frqs) * np.size(vels)        #aka nrips                                      #Seems more concise than MATLAB version --N = size(unique([cat(2,a1rv{:});cat(2,a1rf{:})]','rows'),1)
+    W = vels                                                                                 #array of ripple velocities
+    T = int(np.round(fs/min(np.abs(np.diff(np.unique([x for x in W if x != 0]))))))          #
+    Params['T'] = T
+
+    Ompos = [x for x in frqs if x >= 0]                                                      #Get positive frequencies
+    Omneg = [x for x in frqs if x < 0]                                                       #Get negative frequencies
+    Omnegzero = np.flip([x for x in frqs if x <= 0])                                         #just used for populating an array a few lines down
+
+    Omega = np.swapaxes(np.stack((Ompos,Omnegzero)),0,1)                                     #Make an array for main output Omega
+
+    numvels = len(W)                                                                         #
+    numfrqs = np.size(Omega,0)                                                               #Used to make empty array to be populated by params
+    numstim = len(TorcNames)
+
+    waveParams = np.empty([2,numvels,numfrqs,2,numstim])
+
+    ##This part in MATLAB makes T, octaves, maxv, maxf, saf, numcomp
+    basep = int(np.round(fs/min(np.abs(np.diff(np.unique([x for x in W if x != 0]))))))
+    StimParams['basep'] = basep
+    maxvel = np.max(np.abs(W))
+    maxfrq = np.max(np.abs(Omega))
+    saf = int(np.ceil(maxvel*2 + 1000/basep))
+    numcomp = int(np.ceil(maxfrq*2*Octaves + 1))
+    Params['numcomp'] = numcomp
+
+    ##function [ststims,freqs]=stimprofile(waveParams,W,Omega,lfreq,hfreq,numcomp,T,saf);
+    [ap,Ws,Omegas,lr,numstim] = waveParams.shape                               #wave params is 5D, define size of each dimension
+    [a,b] = Omega.shape                                                        #splitting ripple freqs to matrix nums
+    [d] = W.shape                                                              #splitting W into same
+
+    if a*b*d != Omegas*Ws*lr:
+        print('Omega and.or W do not match waveParams')
+
+    #ln(num)/ln(2) = log2(num)
+    #numpy.logspace(start, stop, num=50, endpoint=True, base=10.0, dtype=None, axis=0)
+    ####vvv!!!!!not working right freqrange
+    freqrange = np.logspace(LowestFrequency, HighestFrequency, numcomp+1, endpoint=True, base=2.0)#make log2 scale from low to high freq binned by how many comps
+    sffact = saf/1000                                                        #lower sample rate
+    leng = int(np.round(T*sffact))                                           #stim duration with lower sampling rounded
+    t = np.arange(leng)                                                      #make array for time that takes into account 0 is really first
+    Params['leng'] = leng
+
+    w0 = 1000/T
+    W0 = 1/(np.log2(HighestFrequency/LowestFrequency))
+
+    k = np.round(W/w0)
+    l = np.round(Omega/W0)
+
+    ststims = np.zeros([numcomp, leng, numstim])                            #to be our output of TORCS
+
+    cnew = [np.floor(numcomp/2)+1, np.floor(leng/2)+1]
+
+    ###this part is important###
+    TorcValues = dict()                                                                #make new dict for function output
+    for key,value in TorcParams.items():                                               #cycle through with all the different TORC names and respective values
+        y_sum = torcmaker(value,Params)                                                #output of function (TORC) assigned to variable
+        TorcValues[key] = y_sum                                                        #update dict with the key you are on and the value the function just returned
+
+    # ######plot all torcs in subplots -!!!eventually make this optional input?
+    # row = int(np.ceil(math.sqrt(len(TorcValues.keys()))))
+    # col = int(np.floor(math.sqrt(len(TorcValues.keys()))))
+    #
+    # if row * col < len(TorcValues.keys()):
+    #     row = row + 1
+    #
+    # torcfig, torcaxs = plt.subplots(row, col, sharex=False, sharey=False, squeeze=False)
+    #
+    # axsall = np.ravel(torcaxs)
+    #
+    # plt.xlabel('Time')
+    # plt.ylabel('Frequency')
+    #
+    # for ttt,(key,value) in enumerate(TorcValues.items()):
+    #     axsall[ttt].imshow(value)
+    #######
+
+    ########checkmatlab######
+    # import scipy.io as sio                                             #
+    # StStims = sio.loadmat('/auto/users/hamersky/stims.mat')            #load Matlab file as dictionary
+    # ststims = StStims['ststims']                                       #pull out the data as variable
+    # [mlx,mlt,torcnum] = ststims.shape                                  #assign variables to the shapes
+    # renametorc = TorcNames                                             #call TorcNames for here
+    #
+    # MatlabTorcs = dict()                                               #open new dict to be comparable to TorcValues
+    # for iii in range(torcnum):                                         #go through in range of 'numstims'
+    #     whichtorc = ststims[:,:,iii]                                   #each iteration save that torc as variable
+    #     eee = renametorc[iii]                                          #get the corresponding torcname as num we're on
+    #     MatlabTorcs[eee] = whichtorc                                   #assign the key and the value, looks like TorcValues
+    #
+    # ststims = np.around(ststims[:,:,:],decimals=4)
+    #     for nn,(key,value) in enumerate(TorcValues.items()):
+    #         torccc = np.around(value,decimals=4)
+    #         if np.all(torccc == ststims[:,:,nn]):
+    #             print(f'{nn} True')
+    #         else:
+    #             print(f'{nn} False')
+    #
+    # for qwer in range(spdata2trimmat.shape[0]):
+    #     if np.all(spdata2trimmat[qwer, 17, 16] == spdata2trim[qwer, 17, 16]):
+    #         print(qwer, "True")
+    #     else:
+    #         print(qwer, "False")
+    #########################
+
+    ###Going into the stimscale#########################################################
+    #function stim = stimscale(stim,REGIME,OPTION1,OPTION2,tsiz,xsiz); -our data made moddep 0.9 [] 250 30
+    # 3)'moddep': Specified modulation depth;
+    #	OPTION1 is the modulation depth as a fraction of 1. The default is 0.9.
+    #	OPTION2 is not required.
+
+    ModulationDepth = 0.9                                                              #default set in matlab program
+    base1= 0                                                                           #hard coded in matlab
+    numtorc = len(TorcValues.keys())                                                   #how many torcs there are, again
+    xSize = int(np.round(10*numcomp/Octaves))   #30                                    #new x sampling rate
+    tSize = int(10*saf*basep/1000)              #250                                   #new t sampling rate
+    ScaledTorcs = dict()                                                               #new dictionary for scaled torcs
+
+    for key,value in TorcValues.items():                                               #go through this with all torcs
+        [xsiz, tsiz] = value.shape                                                     #basic dims of torc
+        temp = value                                                                   #pull out numbers to usable variable
+
+        if xSize != xsiz & tSize != tsiz:                                              #when new sampling rate doesn't equal old vals
+            temp1 = interpft(interpft(temp,xSize,0),tSize,1)                           #add points, yielding bigger array
+
+            scl = np.max(np.abs([np.min(np.min(temp1)), np.max(np.max(temp1))]))       #largest |value| is scale factor
+
+            temp2 = base1 + temp*ModulationDepth/scl                                   #transform original torc values with moddep and calc'd scale
+
+        ScaledTorcs[key] = temp2                                                       #populate dictionary with new values
+    ####################################################################################
+
+    #Back to main strf_est_core function (matlab) - scaled and all good
+    [stimX,stimT] = temp.shape                                                                   #have var for dims of torc
+    binsize = int(basep/stimT)                                                                   #number of bins
+
+    strfest = np.zeros([stimX,stimT])                                                            #empty array same size as torc
+
+    ##only loop over real (nonNaN) reps, may be diff number of reps for diff torcs
+    #in my code, 'stacked' is matlab's 'r'
+    if stacked.shape[0] <= fs/4:                                                                     #multiple cycles
+        realrepcount = np.max(np.logical_not(np.isnan(stacked[1,:,1])).ravel().nonzero())+1            #
+    else:                                                                                        #go to here, all 10 are real and used
+        realrepcount = np.max(np.logical_not(np.isnan(stacked[int(np.round(fs/4))+1,:,1])).ravel().nonzero())+1
+
+    #[pp,bb]=fileparts(mfilename)                                           ##don't know what this is for...##
+
+    if INC1stCYCLE == 1:                                                               #Some maybe useless code, cause I defaulted var to 0
+        if stacked.shape[0]>250:                                                           #
+            print('Including 1st TORC Cycle')                                          #Stim starts on 0 cause not excluding
+        FirstStimTime = 0                                                              #
+    elif INC1stCYCLE > 0:                                                              #
+        FirstStimTime = INC1stCYCLE                                                    #
+    else:                                                                              #
+        FirstStimTime = basep                                                          #This is what will be happening
+
+    #Get things ready for snr inputs#
+    stim = np.stack(list(ScaledTorcs.values()),axis=2)                                 #take my lovely dictionary and smoosh it for now
+
+    a1rv = []                                                                          #create empty list for all the Torcs' respective velocities
+    for key,values in TorcParams.items():                                              #iterate through dict
+        torcrate = values['Rates']                                                     #access the rate for each key,value combo
+        a1rv.append(torcrate)                                                          #add each time this iterates to a list of lists
+    allrates = np.asarray(a1rv)                                                        #transform list of list into an array
+
+    if stacked.shape[1]>1:
+        snr = get_snr(stacked,stim,basep,mf,allrates)
+    else:
+        snr = 0
+    ###
+    rmat = sio.loadmat('/auto/users/hamersky/r.mat')
+    rmat = rmat['r']
 
 
-epoch_regex = "^STIM_TORC_.*"                                                            #pick all epochs that have STIM_TORC_...
-epochs_to_extract = ep.epoch_names_matching(signal.epochs, epoch_regex)                  #find those epochs
-r = signal.extract_epochs(epochs_to_extract)                                             #extract them, r.keys() yields names of TORCS that can be looked through as dic r['name']...can be np.squeeze(0, np.mean(
+    ##Enter 'if jackN' section - I'm going to assume there are none and follow the if not portion of matlab
+    jackN = 0
+    if not jackN:                                                                      #normalize by the num of reps that were presented
+        for rep in range(realrepcount):                                                #for this particular record (can be variable for DMS or
+            for rec in range(numstim):                                                 #any data set that was interrupted in mid of a rep
 
-all_arr = list()                                                                         #create empty list
-for val in r.values():                                                                   #for the 30 TORCs in r.values()
-    fval = np.swapaxes(np.squeeze(val),0, 1)                                             #create a var to get rid of the third dim (which was a one) and switch the other two axes
-    all_arr.append(fval)                                                                 #make all_arr have that swap
-stacked = np.stack(all_arr, axis=2)                                                      #stack the #cell on to make like 'r' from MATLAB (time x sweeps x recordings)
+                if np.all(stacked[0] <= fs/4):                                                 #
+                    thisrepcount = sum(np.logical_not(np.isnan(stacked[0,:,rec])))     #this line is direct translation from matlab, wasn't used so can't test actual functionality with numbers, does exact same thing though
+                else:
+                    thisrepcount = sum(sum(np.logical_not(np.isnan(stacked[int(np.round(fs/4)+1):,:,0]))) > 0).astype(int)
 
-#first param in r, time, doesn't match MATLAB, which is 750, here stacked.shape is (145, 10, 30)
-TorcObject = exptparams["TrialObject"][1]["ReferenceHandle"][1]                          #will be strf_core_est input
-TorcNames = exptparams["TrialObject"][1]["ReferenceHandle"][1]["Names"]
-TorcKeys = exptparams["TrialObject"][1]["ReferenceHandle"][1].keys()
-RefDuration = TorcObject['Duration']
-Events = exptevents
+                if thisrepcount == 0:
+                    thisrepcount = 1
 
+                #spkdata = stacked[:,rep,rec]
+                spkdata = (rmat[:,rep,rec]).astype('float64')
 
-PreStimSil = TorcObject['PreStimSilence']
-PostStimSil = TorcObject['PostStimSilence']
-#binsize = fs
-PreStimbin = int(TorcObject['PreStimSilence']*fs)                                        #how many bins in prestimsilence
-PostStimbin = int(TorcObject['PostStimSilence']*fs)                                      #how many bins in poststimsilence
-numbin = stacked.shape[0]                                                                #total bins in total time length
-INC1stCYCLE = 0                                                                          #default 0
-mf = int(fs/1000)                                                                        #silly, but useful later?
-stdur = int(RefDuration*1000)
-ddur = int(RefDuration*1000)
-stonset = 0
-stacked = stacked[PreStimbin:(numbin-PostStimbin),:,:]                                   #slice array from first dimensions, bins in pre and post silence, isolate middle 750
+                ###Probably not going to happen in this case
+                # if fs != 1000:                                                         #this might not be a great translation
+                #     spkdata = sp.signal.resample(stacked,1000)                         #probably not, couldn't find ==resample()
+                if fs != 1000:
+                    spkdata = sp.signal.resample(stacked,1000)
 
+                if len(spkdata) < stdur:
+                    spkdata = np.concatenate((spkdata,np.ones(stdur-len(spkdata))*np.nan),axis=None)
+                ###next part will
 
-###change nesting to TORCs(StimParam(...))
-TorcParams = dict.fromkeys(TorcNames)                                                    #Create dict from TorcNames
-all_freqs = list()                                                                       #Create empty list of freqs
-all_velos = list()                                                                       #Create empty list of velos
-all_hfreq = list()
-all_lfreq = list()
-for tt, torc in enumerate(TorcNames):                                                    #Number them
-    TorcParams[torc] = exptparams["TrialObject"][1]["ReferenceHandle"][1]["Params"][tt + 1]     #insert Params 1-30 to torcs 1-30 now TORCs(Params(...)) nested other way
-    freqs = TorcParams[torc]['Scales']                                                   #Add all TORCs' Scales value as var
-    velos = TorcParams[torc]['Rates']                                                    #Add all TORCs' Rates value as var
-    all_freqs.append(freqs)                                                              #
-    all_velos.append(velos)                                                              #
-    highestfreqs = TorcParams[torc]['HighestFrequency']
-    lowestfreqs = TorcParams[torc]['LowestFrequency']
-    all_hfreq.append(highestfreqs)
-    all_lfreq.append(lowestfreqs)
-frqs = np.unique(np.concatenate(all_freqs))                                              #Smoosh to one array and output unique elements
-vels = np.unique(np.concatenate(all_velos))                                              #temporal spectra
-HighestFrequency = int(np.unique(all_hfreq))
-LowestFrequency = int(np.unique(all_lfreq))
-Octaves = np.log2(HighestFrequency/LowestFrequency)
-phi = 0                                                                                #arbitrarily make 0 per Stephen's code
+                [Dsum,cnorm] = makepsth(spkdata.copy(),int(1000/basep),int(FirstStimTime),stdur,mf)
 
-###
-Ompos = [x for x in frqs if x >= 0]                                                      #Get positive frequencies
-Omneg = [x for x in frqs if x < 0]                                                       #Get negative frequencies
-Omnegzero = [x for x in frqs if x <= 0]                                                  #just used for populating an array a few lines down
+                #Time to normalize by #cycles. May be variable for TORCs, since they could be shorter than length in exptparams
+                Dsum = Dsum / (cnorm + (cnorm == 0))
 
-N = np.size(frqs) * np.size(vels)        #aka nrips                                      #Seems more concise than MATLAB version --N = size(unique([cat(2,a1rv{:});cat(2,a1rf{:})]','rows'),1)
-W = vels                                                                                 #array of ripple velocities
-T = np.round(fs/min(np.abs(np.diff(np.unique([x for x in W if x != 0])))))               #
+                if binsize > 1/mf:
+                    Dsum = insteadofbin(Dsum,binsize,mf)
+                Dsum = Dsum * (1000/binsize)                                           #normalization by bin size
 
-Omega = np.swapaxes(np.stack((Ompos,Omnegzero)),0,1)                                     #Make an array for main output Omega
+                if sum(np.isnan(Dsum)) or not thisrepcount:
+                    print('NaN STRF: rep {} rec {}'.format(rep,rec))
+                else:
+                    Stim = stim[:,:,rec]
+                    strftemp = np.zeros(strfest.shape)
 
-numvels = len(W)                                                                         #
-numfrqs = np.size(Omega,0)                                                               #Used to make empty array to be populated by params
-numstim = len(TorcNames)
+                for abc in range(stimX):
+                    stimrow = Stim[abc,:]
+                    strftemp[abc,:] = np.fft.ifft(np.conj(np.fft.fft(stimrow)) * np.fft.fft(np.squeeze(Dsum))).real
 
-waveParams = np.empty([2,numvels,numfrqs,2,numstim])
+                strftemp = strftemp / stimT                                                     #normalization
+                strftemp = strftemp * (2 * N / np.mean(np.mean(np.square(Stim)))/numstim)       #normalization
 
-##This part in MATLAB makes T, octaves, maxv, maxf, saf, numcomp
-basep = np.round(fs/min(np.abs(np.diff(np.unique([x for x in W if x != 0])))))
-maxvel = np.max(np.abs(W))
-maxfrq = np.max(np.abs(Omega))
-saf = np.ceil(maxvel*2 + 1000/basep)
-numcomp = np.ceil(maxfrq*2*Octaves + 1)
+                strfest = strfest + strftemp / thisrepcount
 
-##function [ststims,freqs]=stimprofile(waveParams,W,Omega,lfreq,hfreq,numcomp,T,saf);
-[ap,Ws,Omegas,lr,numstim] = waveParams.shape                              #wave params is 5D, define size of each dimension
-[a,b] = Omega.shape                                                        #splitting ripple freqs to matrix nums
-[d] = W.shape                                                              #splitting W into same
+    strfemp = np.zeros(strfest.shape)
+    #I've left out the last part of strf_est_core() which has what happens if jackN exists, probably easy to throw in if needed
 
-if a*b*d != Omegas*Ws*lr:
-    print('Omega and.or W do not match waveParams')
+    return strfest,snr,stim,strfemp,StimParams
 
-#ln(num)/ln(2) = log2(num)
-#numpy.logspace(start, stop, num=50, endpoint=True, base=10.0, dtype=None, axis=0)
-freqrange = np.logspace(LowestFrequency, HighestFrequency, numcomp+1, endpoint=True, base=2.0)#make log2 scale from low to high freq binned by how many comps
-sffact = saf/1000                                                        #lower sample rate
-leng = int(np.round(T*sffact))                                                #stim duration with lower sampling rounded
-numcomp = int(numcomp)
-t = np.arange(leng)                                                      #make array for time that takes into account 0 is really first
-
-w0 = 1000/T
-W0 = 1/(np.log2(HighestFrequency/LowestFrequency))
-
-k = np.round(W/w0)
-l = np.round(Omega/W0)
-
-ststims = np.zeros([numcomp, leng, numstim])                            #to be our output of TORCS
-
-cnew = [np.floor(numcomp/2)+1, np.floor(leng/2)+1]
-
+####################################################################################
+####################################################################################
+####################################################################################
 ###Function to return the TORC - option to plot each Torc###
-def torcmaker(TORC):
+def torcmaker(TORC,Params):
     lfreq = TORC['LowestFrequency']
     hfreq = TORC['HighestFrequency']
     Scales = TORC['Scales']
@@ -152,8 +341,10 @@ def torcmaker(TORC):
 
     octaves = np.log2(hfreq)-np.log2(lfreq)
     normed_scales = [s*octaves for s in Scales]
-    cycles_per_sec = 1000/T
+    cycles_per_sec = 1000/Params['T']
     normed_tempmod= [t/cycles_per_sec for t in Rate]
+    numcomp = Params['numcomp']
+    leng = Params['leng']
 
     # somehow we've figured out that final spectrogram should be
     # (numcomp spectral dimension rows) X (leng time samples per TORC cycle)
@@ -162,7 +353,7 @@ def torcmaker(TORC):
     c = [np.floor(numcomp/2), np.floor(leng/2)]
 
     for i, (vel,phs,amp,scl) in enumerate(zip(normed_tempmod,Phase,Amplitude,normed_scales)):
-        print("ripple {}: vel={}, phi={}, amp={}, scl={}".format(i,vel,phs,amp,scl))
+        #print("ripple {}: vel={}, phi={}, amp={}, scl={}".format(i,vel,phs,amp,scl))
 
         # figure out index in fourier domain for each ripple
         v1=int(vel+c[1])
@@ -179,56 +370,24 @@ def torcmaker(TORC):
 
     y_sum = (np.fft.ifft2(np.fft.ifftshift(stimHolder*(leng*numcomp)))).real
     return y_sum
-######
 
-###this part is important###
-TorcValues = dict()                                                                #make new dict for function output
-for key,value in TorcParams.items():                                               #cycle through with all the different TORC names and respective values
-    y_sum = torcmaker(value)                                                       #output of function (TORC) assigned to variable
-    TorcValues[key] = y_sum                                                        #update dict with the key you are on and the value the function just returned
-
-
-
-# ######plot all torcs in subplots -!!!eventually make this optional input?
-# row = int(np.ceil(math.sqrt(len(TorcValues.keys()))))
-# col = int(np.floor(math.sqrt(len(TorcValues.keys()))))
-#
-# if row * col < len(TorcValues.keys()):
-#     row = row + 1
-#
-# torcfig, torcaxs = plt.subplots(row, col, sharex=False, sharey=False, squeeze=False)
-#
-# axsall = np.ravel(torcaxs)
-#
-# plt.xlabel('Time')
-# plt.ylabel('Frequency')
-#
-# for ttt,(key,value) in enumerate(TorcValues.items()):
-#     axsall[ttt].imshow(value)
-    #axsall[ttt].title[]
-#######
-
-########checkmatlab######
-
-# import scipy.io as sio                                             #
-# StStims = sio.loadmat('/auto/users/hamersky/stims.mat')            #load Matlab file as dictionary
-# ststims = StStims['ststims']                                       #pull out the data as variable
-# [mlx,mlt,torcnum] = ststims.shape                                  #assign variables to the shapes
-# renametorc = TorcNames                                             #call TorcNames for here
-#
-# MatlabTorcs = dict()                                               #open new dict to be comparable to TorcValues
-# for iii in range(torcnum):                                         #go through in range of 'numstims'
-#     whichtorc = ststims[:,:,iii]                                   #each iteration save that torc as variable
-#     eee = renametorc[iii]                                          #get the corresponding torcname as num we're on
-#     MatlabTorcs[eee] = whichtorc                                   #assign the key and the value, looks like TorcValues
-
-#########################
-
-
+############################################################################################################
+############################################################################################################
 ###########Function to interpolate using FT method, based on matlab interpft()######
-def interpft(x,ny,dim):                                                            #input torc array, new sampling, which dimension to interpolate on
+def interpft(x,ny,dim=0):                                                         #input torc array, new sampling, which dimension to interpolate on
+    # if not dim:
+    #     x = np.expand_dims(x,axis=1)
+    #     if np.isscalar(x):
+    #         nshifts = 1
+    #     else:
+    #         nshifts = 0
+    # else:
+    #     x = np.swapaxes(x,0,dim)
+
     if dim >= 1:                                                                   #if interpolating along columns, dim = 1
         x = np.swapaxes(x,0,dim)                                                   #temporarily swap axes so calculations are universal regardless of dim
+    if len(x.shape) == 1:
+        x = np.expand_dims(x,axis=1)
 
     siz = x.shape                                                                  #what is the torc size overall
     [m, n] = x.shape                                                               #unique var for each torc dimension
@@ -253,72 +412,16 @@ def interpft(x,ny,dim):                                                         
     #y = y[1:ny:incr,:]                                                             #
 
     y = np.reshape(y, [y.shape[0],siz[1]])                                             #should preserve shape
+
+    y = np.squeeze(y)
+
     if dim >= 1:                                                                   #as above, if interpolating along columns
         y = np.swapaxes(y,0,dim)                                                   #swap axes back and y will be correct
 
     return y                                                                       #returned value
 
-####################################################################################
-
-
-###Going into the stimscale#########################################################
-#function stim = stimscale(stim,REGIME,OPTION1,OPTION2,tsiz,xsiz); -our data made moddep 0.9 [] 250 30
-# 3)'moddep': Specified modulation depth;
-#	OPTION1 is the modulation depth as a fraction of 1. The default is 0.9.
-#	OPTION2 is not required.
-
-ModulationDepth = 0.9                                                              #default set in matlab program
-base1= 0                                                                           #hard coded in matlab
-numtorc = len(TorcValues.keys())                                                   #how many torcs there are, again
-xSize = int(np.round(10*numcomp/Octaves))   #30                                    #new x sampling rate
-tSize = int(10*saf*basep/1000)              #250                                   #new t sampling rate
-ScaledTorcs = dict()                                                                #new dictionary for scaled torcs
-
-for key,value in TorcValues.items():                                               #go through this with all torcs
-    [xsiz, tsiz] = value.shape                                                     #basic dims of torc
-    temp = value                                                                   #pull out numbers to usable variable
-
-    if xSize != xsiz & tSize != tsiz:                                              #when new sampling rate doesn't equal old vals
-        temp1 = interpft(interpft(temp,xSize,0),tSize,1)                           #add points, yielding bigger array
-
-        scl = np.max(np.abs([np.min(np.min(temp1)), np.max(np.max(temp1))]))       #largest |value| is scale factor
-
-        temp2 = base1 + temp*ModulationDepth/scl                                   #transform original torc values with moddep and calc'd scale
-
-    ScaledTorcs[key] = temp2                                                       #populate dictionary with new values
-####################################################################################
-
-
-
-#Back to code - scaled and all good
-scaled_torc_size = temp                                                                      #new section, new var
-[stimX,stimT] = scaled_torc_size.shape                                                       #have var for dims of torc
-binsize = basep/stimT                                                                        #number of bins
-
-strfest = np.zeros([stimX,stimT])                                                            #empty array same size as torc
-
-##only loop over real (nonNaN) reps, may be diff number of reps for diff torcs
-#in my code, 'stacked' is matlab's 'r'
-if stacked.shape[0] <= fs/4:                                                                     #multiple cycles
-    realrepcount = np.max(np.logical_not(np.isnan(r[1,:,1])).ravel().nonzero())+1            #
-else:                                                                                        #go to here, all 10 are real and used
-    realrepcount = np.max(np.logical_not(np.isnan(stacked[int(np.round(fs/4))+1,:,1])).ravel().nonzero())+1
-
-#[pp,bb]=fileparts(mfilename)                                           ##don't know what this is for...##
-
-if INC1stCYCLE == 1:                                                               #Some maybe useless code, cause I defaulted var to 0
-    if stacked.shape[0]>250:                                                           #
-        print('Including 1st TORC Cycle')                                          #Stim starts on 0 cause not excluding
-    FirstStimTime = 0                                                              #
-elif INC1stCYCLE > 0:                                                              #
-    FirstStimTime = INC1stCYCLE                                                    #
-else:                                                                              #
-    FirstStimTime = basep                                                          #This is what will be happening
-
-
-
-##################ENTER SNR FUNCTIONS###############################################
-####################################################################################
+############################################################################################################
+############################################################################################################
 ###SUBFUNCTION - insteadofbin()#####################################################
 #inputs spikeperiod (250x30)=resp; basep(250)/stimtime(25)=binsize; mf(1)=mf########
 #Downsample spike histogram from resp (resolution mf) to resolution by binsize(ms)##
@@ -353,27 +456,29 @@ def insteadofbin(resp,binsize,mf=1):                                            
     return dsum
 
 ####################################################################################
-
-
 ####################################################################################
 ########going into some SNR#########################################################
 #snr = get_snr(spdata, stim, basep, mf, waveParams, alrv)                      #####
 #r,StStims,StimParam.basep,StimParam.mf,waveParams,StimParam.a1rv)             #####
 #r=stacked, StStims=ScaledTorcs, basep=250, mf =1, waveparams is huge, alrv    #####
 def get_snr(spdata,stim,basep,mf,allrates):
+    ###
+    rmat = sio.loadmat('/auto/users/hamersky/r.mat')
+    spdata = rmat['r']
+    ###
     spdata[(np.isnan(spdata)).ravel().nonzero()] = 0                                   #get rid of not numbers
     [numdata,numsweeps,numrecs] = spdata.shape                                         #dims to vars
-    [stimfreq, stimtime] = temp.shape                                                  #dims to vars
+    [stimfreq,stimtime,numstims] = stim.shape                                          #dims to vars
 
     invlist = []                                                                       #no clue what this is for actually, it's subsequent uses are commented out
 
-    if spdata.shape[2] != len(ScaledTorcs.keys()):                                     #just a check
+    if spdata.shape[2] != stim.shape[2]:                                               #just a check
         print('Number of records and stimuli are not equal')                           #doubt this'll happen
 
     # for key, value in ScaledTorcs.items():                                             #pretty unnecessary
     #     [stimfreq,stimtime] = value.shape                                              #a better way to get these I think
 
-    #Response variabiity as a function of frequency per stimulus (-pair)#
+    #Response variability as a function of frequency per stimulus (-pair)#
     #-------------------------------------------------------------------#
     n = numsweeps * numdata / mf / basep                                                                       #
     tmp = spdata[range(int(np.round(np.floor(n / numsweeps) * mf * basep))),:,:]                               #temp is the same as spdata
@@ -435,26 +540,8 @@ def get_snr(spdata,stim,basep,mf,allrates):
                                                                                #####
                                                                                #####
 #got snr#                                                                      #####
-####################################################################################
-####################################################################################
-
-#Get things ready for snr inputs#
-stim = np.stack(list(ScaledTorcs.values()),axis=2)                                 #take my lovely dictionary and smoosh it for now
-
-a1rv = []                                                                          #create empty list for all the Torcs' respective velocities
-for key,values in TorcParams.items():                                              #iterate through dict
-    torcrate = values['Rates']                                                     #access the rate for each key,value combo
-    a1rv.append(torcrate)                                                          #add each time this iterates to a list of lists
-allrates = np.asarray(a1rv)                                                        #transform list of list into an array
-
-if stacked.shape[1]>1:
-    snr = get_snr(stacked,stim,basep,mf,allrates)
-else:
-    snr = 0
-
-####################################################################################
-#######################MAKEPSTH#####################################################
-####################################################################################
+############################################################################################################
+############################################################################################################
 #makepsth() [wrapdata,cnorm] = makepsth(dsum,fhist,startime,endtime,mf)#############
 ##"PSTH: Creates a period histogram according to  period iplied by inputfreq FHIST"#
 
@@ -491,353 +578,240 @@ def makepsth(dsum,fhist,startime,endtime,mf=1):
     return wrapdata,cnorm
 
     ##There's extra code that SVD 'hacked' to allow for includsion of the first TORC
-####################################################################################
-####################################################################################
-
-
-
-##Enter 'if jackN' section - I'm going to assume there are none and follow the if not portion of matlab
-jackN = 0
-if not jackN:                                                                      #normalize by the num of reps that were presented
-    for rep in range(realrepcount):                                                #for this particular record (can be variable for DMS or
-        for rec in range(numstim):                                                 #any data set that was interrupted in mid of a rep
-
-            if np.all(stacked[0] <= fs/4):                                                 #
-                thisrepcount = sum(np.logical_not(np.isnan(stacked[0,:,rec])))     #this line is direct translation from matlab, wasn't used so can't test actual functionality with numbers, does exact same thing though
-            else:
-                thisrepcount = sum(sum(np.logical_not(np.isnan(stacked[int(np.round(fs/4)+1):,:,0]))) > 0).astype(int)
-
-            if thisrepcount == 0:
-                thisrepcount = 1
-
-            spkdata = stacked[:,rep,rec]
-
-            ###Probably not going to happen in this case
-            if fs != 1000:                                                         #this might not be a great translation
-                spkdata = sp.signal.resample(stacked,1000)                         #probably not, couldn't find ==resample()
-
-            if len(spkdata) < stdur:
-                spkdata = np.concatenate((spkdata,(np.ones((stdur-len(spkdata),1)) * np.nan)))
-            ###next part will
-
-            [Dsum,cnorm] = makepsth(spkdata.copy(),int(1000/basep),int(FirstStimTime),stdur,mf)
-
-            #Time to normalize by #cycles. May be variable for TORCs, since they could be shorter than length in exptparams
-            Dsum = Dsum / (cnorm + (cnorm == 0))
-
-            if binsize > 1/mf:
-                Dsum = insteadofbin(Dsum,binsize,mf)
-            Dsum = Dsum * (1000/binsize)                                           #normalization by bin size
-
-            if sum(np.isnan(Dsum)) or not thisrepcount:
-                print('NaN STRF: rep {} rec {}'.format(rep,rec))
-            else:
-                Stim = stim[:,:,rec]
-                strftemp = np.zeros(strfest.shape)
-
-            for abc in range(stimX):
-                stimrow = Stim[abc,:]
-                strftemp[abc,:] = np.fft.ifft(np.conj(np.fft.fft(stimrow)) * np.fft.fft(np.squeeze(Dsum))).real
-
-            strftemp = strftemp / stimT                                                     #normalization
-            strftemp = strftemp * (2 * N / np.mean(np.mean(np.square(Stim)))/numstim)       #normalization
-
-            strfest = strfest + strftemp / thisrepcount
-
-strfemp = np.zeros(strfest.shape)
-#I've left out the last part of strf_est_core() which has what happens if jackN exists, probably easy to throw in if needed
-####################################################################################
-####################################################################################
-####################################################################################
-
-
-#strf_est_core() outputs strf0 (strfest), snr, StimParams, strfemp
-#back to tor_tuning()
-
-#Make strf torc prediction (it's own tiny function in matlab
-pred = np.zeros((stimT,numstim))
-
-for rec in range(numstim):
-    for X in range(stimX):
-        tr = (np.fft.ifft(np.fft.fft(stim[X,:,rec]) * np.fft.fft(strfest[X,:]))).real
-
-        pred[:,rec] = pred[:,rec] + tr
-
-if INC1stCYCLE:
-    FirstStimTime = 0
-else:
-    FirstStimTime = 250
-numreps = stacked.shape[1]
-numstims = stacked.shape[2]
-
-stackeduse = stacked[FirstStimTime:,:,:]
-cyclesperrep = int(stackeduse.shape[0] / basep)
-totalreps = numreps * cyclesperrep
-
-stackeduse = np.reshape(stackeduse, [int(basep),totalreps,numstims], order='F')
-
-##not sure why I'm forcing jacks now, but I'll figure it out
-jackcount = 16
-jstrf = np.zeros((strfest.shape[0],strfest.shape[1],jackcount))
-jackstep = totalreps / jackcount
-mm = int(np.round(totalreps / 2))
-xc = np.expand_dims(np.zeros(jackcount),axis=1)
-
-for jj in range(jackcount):
-    estidx = range(mm) + np.round((jj) * jackstep) + 1
-    estidx = (np.remainder(estidx - 1, totalreps)).astype(int)
-    validx = (np.setdiff1d(range(totalreps), estidx)).astype(int)
-    tr = np.expand_dims(np.nanmean(stackeduse[:,estidx,:], 1),axis=1)
-    trval = np.nanmean(stackeduse[:,validx,:],1)
-
-
-
-
-
-jstrf(:,:, jj)=strf_est_core(tr, TorcObject, rasterfs, 1);
-
-pred = strf_torc_pred(jstrf(:,:, jj), StimParam.StStims);
-trval2 = zeros(size(pred));
-for ii=1:size(trval, 2),
-trval2(:, ii)=resample(trval(:, ii), stimT, StimParam.basep);
-end
-xc(jj) = xcov(trval2(:), pred(:), 0, 'coeff');
-end
-linpred = mean(xc);
-
-
-
-
-
-
-
-
-
-
-
-
-
-################
-repcount = len(stacked[2])
-
-
-for rep in range(repcount):
-    for rec in range(numstims):
-    spkdata = stacked[:,rep,rec]
-
-    ##make psth function
-    fhist = 1000/T
-    dsum = spkdata[:]
-    mf = fs/1000
-    Period = 1000*(1/fhist)*mf
-    StartTime = T*mf
-    EndTime = RefDuration*1000*mf
-
-    fillmax = np.ceil(EndTime/Period)*Period
-    repcount = fillmax/Period
-
-
-    [dsum, cnorm] = makepsth(spkdata, 1000 / StimParam.basep, FirstStimTime, ...
-    StimParam.stdur, StimParam.mf);
-
-
-
-
-         spkdata = r(:,rep,rec);
-         if rasterfs~=1000,
-            spkdata=resample(spkdata,1000,rasterfs);
-         end
-
-
-###In the regular function it generates how to get WaveParams, I think this is where I would switch that because I'm doing the nesting the other way
-Joe = TorcParams['TORC_448_LIN_01_h501']
-
-lfreq = Joe['LowestFrequency']
-hfreq = Joe['HighestFrequency']
-octaves = np.log2(hfreq/lfreq)
-RipAmp = Joe['RippleAmplitude']
-Scales = Joe['Scales']
-Phase = Joe['Phase']
-Rate = Joe['Rates']
-
-###Into makestimprofile [waveParams,W,Omega,N,T,k] = makestimprofile(a1am=RipAmp,a1rf=Scales,a1ph=Phase,a1rv=Rate)
-
-numstims = len(TorcParams)                                                                    #TORCs in dict says how many total as ref
-vels = Rate
-for freqs in enumerate(TorcParams.keys()):
-
-
-
-frqs = unique(exptparams.TORCs[])
-
-
-vels = cat(2,a1rv{:});
-frqs = cat(2,a1rf{:});
-frqs(find(vels<0)) = -frqs(find(vels<0));
-vels = unique(abs(vels));
-frqs = np.linspace(-1.400,1.400,15)
-
-
-
-N = size(unique([cat(2,a1rv{:});cat(2,a1rf{:})]','rows'),1);
-W = vels;
-T = round(1000/min(abs(diff([0 unique(abs(W(find(W))))]))));
-%k = round(abs(cat(1,a1rv{:}))'*T/1000 + 1);
-
-#########
-INC1stCYCLE = 0
-
-referencecount = exptparams["TrialObject"][1]["ReferenceHandle"][1]["MaxIndex"]          #How many TORCs, reference
-referenceduration = exptparams["TrialObject"][1]["ReferenceHandle"][1]["Duration"]       #Duration of TORC, reference
-##Time to define some parameters for later
-StimParam = dict()                                                                       #Make a dictionary to fill down there
-StimParam['numrecs'] = referencecount
-StimParam['mf'] = fs/1000
-StimParam['ddur'] = np.round(1000*referenceduration)
-StimParam['stdur'] = np.round(1000*referenceduration)
-StimParam['stonset'] = 0
-StimParam['lfreq'] = exptparams["TrialObject"][1]["ReferenceHandle"][1]["Params"][1]["LowestFrequency"]
-StimParam['hfreq'] = exptparams["TrialObject"][1]["ReferenceHandle"][1]["Params"][1]["HighestFrequency"]
-StimParam['octaves'] = np.log2(StimParam['hfreq']/StimParam['lfreq'])
-StimParam['alam'] = list()
-StimParam['alrf'] = list()
-StimParam['alph'] = {}
-StimParam['alrv'] = {}
-
-for ii in range(StimParam['numrecs']):
-    StimParam['alam'] = exptparams["TrialObject"][1]["ReferenceHandle"][1]["Params"][1]
-
-
-for ii = 1:StimParam.numrecs
-    StimParam['alam'][ii] = TorcObject.Params(ii).RippleAmplitude;
-    StimParam.a1rf{ii} = TorcObject.Params(ii).Scales;
-    StimParam.a1ph{ii} = TorcObject.Params(ii).Phase;
-    StimParam.a1rv{ii} = TorcObject.Params(ii).Rates;
-end;
-
-###[strf0,snr,StimParam,strfee]=strf_est_core(r,TorcObject,fs,INC1stCYCLE,16);
-
-
-
-
-
-
-
-
-###########################################
-##this may be useful for poststimsilence stuff going up to where r is def
-    d = signal.get_epoch_bounds('PreStimSilence')
-    PreStimSilence = np.mean(np.diff(d)) - 0.5/fs
-    dur = signal.get_epoch_bounds(epochs_to_extract[0])
-    FullDuration = np.mean(np.diff(dur)) - 0.5/fs
-    d = signal.get_epoch_bounds('PostStimSilence')
-    if d.size > 0:
-        PostStimSilence = np.min(np.diff(d)) - 0.5/fs
-        dd = np.diff(d)
-        dd = dd[dd > 0]
+############################################################################################################
+############################################################################################################
+def strf_torc_pred(stim, strfest):
+    [stimX,stimT,numstim] = stim.shape
+    pred = np.zeros((stimT, numstim))
+
+    for rec in range(numstim):
+        for X in range(stimX):
+            tr = (np.fft.ifft(np.fft.fft(stim[X, :, rec]) * np.fft.fft(strfest[X, :]))).real
+
+            pred[:, rec] = pred[:, rec] + tr
+
+    return pred
+
+############################################################################################################
+############################################################################################################
+
+def strfplot(strf0, lfreq, tleng, smooth=0, noct=5, siglev=5,axs=None):
+    if axs == None:
+        fig, axs = plt.subplots()
+    if smooth:
+        if smooth == 1:
+            smooth = [100, 250]
+        strfdata = interpft(interpft(strf0, smooth[0], 0), smooth[1], 1)
+
+        # supposedly python does colorbar scaling on its own, thanks
+        # if len(clim) != 0:
+        #     clim = clim
+        # elif np.max(np.max(np.abs(stdata))):
+        #     clim = [-1*np.max(np.max(np.abs(stdata))),1*np.max(np.max(np.abs(stdata)))]
+        # else:
+        #     clim = [-1,1]
+
+        #f = plt.gcf
+
+        axs.imshow(strfdata, cmap=None, norm=None, aspect='auto', extent=[0, tleng, 0, noct], origin='lower', )
+
+        if lfreq:
+            freqappend = lfreq
+            freqticks = []
+            for fff in range(noct+1):
+                if fff != 0:
+                    freqappend = freqappend * 2
+                freqticks.append(freqappend)
+            axs.set_yticks(np.arange(noct))
+            axs.set_yticklabels(freqticks)
+    return freqticks
+
+######################################################################################
+######################################################################################
+###Main Function here
+def tor_tuning(mfilename,cellid,fs):
+    rec = nb.baphy_load_recording_file(mfilename=mfilename, cellid=cellid,fs=fs, stim=False) #fs=1000
+    globalparams, exptparams, exptevents = nio.baphy_parm_read(mfilename)
+    signal = rec['resp'].rasterize(fs=fs)                                                         #rasterize the signal
+
+    epoch_regex = "^STIM_TORC_.*"                                                            #pick all epochs that have STIM_TORC_...
+    epochs_to_extract = ep.epoch_names_matching(signal.epochs, epoch_regex)                  #find those epochs
+    r = signal.extract_epochs(epochs_to_extract)                                             #extract them, r.keys() yields names of TORCS that can be looked through as dic r['name']...can be np.squeeze(0, np.mean(
+
+    all_arr = list()                                                                         #create empty list
+    for val in r.values():                                                                   #for the 30 TORCs in r.values()
+        fval = np.swapaxes(np.squeeze(val),0, 1)                                             #create a var to get rid of the third dim (which was a one) and switch the other two axes
+        all_arr.append(fval)                                                                 #make all_arr have that swap
+    stacked = np.stack(all_arr, axis=2)       #rasters                                       #stack the #cell on to make like 'r' from MATLAB (time x sweeps x recordings)
+
+    TorcObject = exptparams["TrialObject"][1]["ReferenceHandle"][1]                          #will be strf_core_est input
+    Events = exptevents
+
+    PreStimbin = int(TorcObject['PreStimSilence']*fs)                                        #how many bins in prestimsilence
+    PostStimbin = int(TorcObject['PostStimSilence']*fs)                                      #how many bins in poststimsilence
+    numbin = stacked.shape[0]                                                                # total bins in total time length
+    stacked = stacked[PreStimbin:(numbin-PostStimbin),:,:]                                   #slice array from first dimensions, bins in pre and post silence, isolate middle 750
+
+    INC1stCYCLE = 0                                                                          #default 0
+    [strf0,snr,stim,strfemp,StimParams] = strf_est_core(stacked,TorcObject,exptparams,fs,INC1stCYCLE)
+
+    #Make strf torc prediction (it's own tiny function in matlab
+    pred = strf_torc_pred(stim,strf0)
+
+    if INC1stCYCLE:
+        FirstStimTime = 0
     else:
-        dd = np.array([])
-    if dd.size > 0:
-        PostStimSilence = np.min(dd) - 0.5/fs
+        FirstStimTime = 250
+
+    numreps = stacked.shape[1]
+    numstims = stacked.shape[2]
+    [stimX,stimT,numrecs] = stim.shape
+    basep = StimParams['basep']
+
+    ##
+    rmat = sio.loadmat('/auto/users/hamersky/r.mat')
+    rmat = rmat['r']
+
+    ##
+
+    stackeduse = rmat[FirstStimTime:,:,:]
+    cyclesperrep = int(stackeduse.shape[0] / basep)
+    totalreps = numreps * cyclesperrep
+
+    stackeduse = np.reshape(stackeduse, [int(basep),totalreps,numstims], order='F')
+
+    ##not sure why I'm forcing jacks now, but I'll figure it out
+    jackcount = 16
+    jstrf = np.zeros((strf0.shape[0],strf0.shape[1],jackcount))
+    jackstep = totalreps / jackcount
+    mm = int(np.round(totalreps / 2))
+    xc = np.expand_dims(np.zeros(jackcount),axis=1)
+
+    # for jj in range(jackcount):
+    #     estidx = range(mm) + np.round((jj) * jackstep) + 1
+    #     estidx = (np.remainder(estidx - 1, totalreps)).astype(int)
+    #     validx = (np.setdiff1d(range(totalreps), estidx)).astype(int)
+    #     tr = np.expand_dims(np.nanmean(stackeduse[:,estidx,:], 1),axis=1)
+    #     trval = np.nanmean(stackeduse[:,validx,:],1)
+    #
+    #     [jstrf[:,:,jj],_,_,_,_] = strf_est_core(tr,TorcObject,fs,1)
+    #     jpred = strf_torc_pred(stim,jstrf[:,:,jj])
+    #
+    #     trval2 = np.zeros(pred.shape)
+    #     for ii in range(trval.shape[1]):
+    #         trval2[:,ii] = ssig.resample_poly(trval[:,ii],stimT,basep)
+    #     xc[jj] = np.cov(trval2[:],pred[:],ddof=0)
+    #     #xc(jj) = xcov(trval2(:), pred(:), 0, 'coeff');
+    #
+    # linpred = np.mean(xc)
+
+
+    maxoct = int(np.log2(StimParams['hfreq']/StimParams['lfreq']))
+    stepsize2 = maxoct / strf0.shape[0]
+
+    smooth = [100,strf0.shape[1]]
+    ##tstrf0 = ndi.filters.gaussian_filter(strf0,[0.5,0.001]) never called again in matlab, didn't work anyway
+
+    strfsmooth = interpft(strf0,smooth[0],0)
+    strfempsmooth = interpft(strfemp,smooth[0],0)
+
+    ff = np.exp(np.linspace(np.log(StimParams['lfreq']),np.log(StimParams['hfreq']),strfsmooth.shape[0]))
+
+    mm = np.mean(strfsmooth[:,:7] * (1*(strfsmooth[:,:7] > 0)), 1)
+    if sum(np.abs(mm)) > 0:
+        bfidx = int(sum(((mm == np.max(mm)).ravel().nonzero())))
+        bf = np.round(ff[bfidx])
+        bfshiftbins = (maxoct / 2 - np.log2(bf / StimParams['lfreq'])) / stepsize2
     else:
-        PostStimSilence = 0
-    Duration = FullDuration - PostStimSilence - PreStimSilence
+        bfidx = 1
+        bf = 0
+        bfshiftbins = 0
 
-    r = signal.extract_epochs(epochs_to_extract)
+    bw = sum(mm >= np.max(mm) / 2) / len(mm) * (maxoct-1)
 
-##########################################
+    mmneg = np.mean(strfsmooth[:,:7] * (1*(strfsmooth[:,:7] < 0)), 1)
+    if sum(np.abs(mm)) > 0:
+        wfidx = int(sum(((mmneg == np.min(mmneg)).ravel().nonzero())))
+        wf = np.round(ff[wfidx])
+        wfshiftbins = (maxoct / 2 - np.log2(wf / StimParams['lfreq'])) / stepsize2
+    else:
+        wfidx = 1
+        wf = 0
+        wfshiftbins = 0
 
+    if -mmneg[wfidx] > mm[bfidx]:
+        #if stronger negative component, calculate latency with neg
+        shiftbins = wfshiftbins
+        irsmooth = -interpft(strfsmooth[wfidx,:],250)
+        irempsmooth = interpft(strfempsmooth[wfidx],250,0)
+    else:
+        #use positives
+        shiftbins = bfshiftbins
+        irsmooth = interpft(strfsmooth[bfidx,:],250)
+        irempsmooth = interpft(strfempsmooth[bfidx],250)
 
-#r = time x numsweeps x nrecordings
+    mb = 0
+    #find sig modulated time bins
+    sigmod = np.asarray((irsmooth-mb > irempsmooth*2).ravel().nonzero())
+    #latency mut be >=ms, max latency less than 125ms
+    sigmod = sigmod[np.logical_and(sigmod>=7,sigmod<124)]
 
+    if len(sigmod) > 3:
+        latbin = sigmod[0]
+        dd = np.concatenate([np.diff(sigmod),[41]])
+        durbin = sigmod[np.min((dd[0:] > 40).ravel().nonzero())]
+        lat = int(np.round(latbin * 1000 / fs))
+        offlat = (np.round(durbin * 1000 / fs))
+        print("onset/offset latency:", lat, offlat)
+    else:
+        latbin = 0
+        lat = 0
+        durbin = 0
+        offlat = 0
+        print('no significant onset latency\n')
 
+    #####Time to plot#####
+    fig,axs = plt.subplots(1,3)
 
+    freqticks = strfplot(strf0,StimParams['lfreq'],StimParams['basep'],1,StimParams['octaves'],axs=axs[0])
 
-[strf0,snr,StimParam,strfee]=strf_est_core(r,TorcObject,fs,INC1stCYCLE,16);
+    aa = plt.axis()
 
+    [ylow,yhigh] = axs[0].get_ylim()
+    [xlow,xhigh] = axs[0].get_xlim()
 
-####
-####
-####
+    ydiff = yhigh - ylow
+    ym = ylow + ydiff/2
+    ybf = ym - shiftbins / strf0.shape[0] * ydiff
+    axs[0].hlines(ybf,0,xhigh,linestyle='dashed')
+    axs[0].vlines(latbin,0,yhigh,linestyle='dashed')
+    axs[0].vlines(durbin,0,yhigh,linestyle='dashed')
+    axs[0].set_title('%s - BF %d Hz' % (os.path.basename(mfilename),bf),fontweight='bold')
+    axs[0].set_xlabel('SNR %.2f linxc %.2f' % (snr,snr)) ##linpred
 
+    #move to next subplot
 
+    axs[1].set_ylim(np.min(irsmooth),np.max(irsmooth))
+    axs[1].set_xlim(0,len(irsmooth))
+    #axs[1].axis([np.min(irsmooth),np.max(irsmooth),0,len(irsmooth)])
+    # irsmoothrs = np.expand_dims(irsmooth,axis=0)
+    # irempsmoothrs = np.expand_dims(irempsmooth,axis=0)
+    if np.all(strfempsmooth[:] == 0):
+        axs[1].plot(irsmooth)
+    else:
+        axs[1].errorbar(range(len(irsmooth)),irsmooth,irempsmooth)
+    axs[1].hlines(mb,0,len(irsmooth),linestyle='dashed')
+    axs[1].vlines(latbin,0,(np.max(irsmooth)+np.max(irempsmooth)),linestyle='dashed')
+    axs[1].vlines(durbin,0,(np.max(irsmooth)+np.max(irempsmooth)),linestyle='dashed')
+    axs[1].set_title('On/Off Lat %d/%d ms' % (lat, offlat),fontweight='bold')
 
+    #move to next subplot
 
-
-###
-#Make TORCS
-
-function [ststims,freqs]=stimprofile(waveParams,W,Omega,...                 #all of this lives in TorcObject (what is W)
-				 lfreq,hfreq,numcomp,T,saf);
-
-def stimprofile(waveParams,W,Omega,lfreq,hfreq,numcomp,T,saf=1000):             #=1000 sets default to 1000 if not inputted, like nargin
-
-
-#[ststims,freqs] = ststruct(waveParams,W,Omega,lfreq,hfreq,numcomp,T,saf);
-#
-#STSTRUCT : Spectro-temporal stimulus constructor.
-#
-#waveParams : 5-D matrix containing amplitude and phase pairs for
-#             all components of all waveforms (see MAKEWAVEPARAMS)
-#W          : Vector of ripple velocities
-#Omega      : Matrix of ripple frequencies
-#lfreq      : lowest frequency component
-#hfreq      : highest frequency component
-#numcomp    : number of components (frequency length)
-#T          : stimulus duration (ms)
-#saf 	     : sampling frequency (default = 1000 Hz)
-
-          %
-
-###
-###
-
-def tor_tuning(mfilename,channum,unit,plotaxes):
-    load_URI = nb.baphy_load_recording_uri(**options)
-    loaded_rec = recording.load_recording(load_URI)
-    rec = loaded_rec
-
-    signal = rec['resp']
-    signals = rec.signals
-
-    parmfile =
-
-
-
-
-################Old version torcmaker() I was working with that didn't quite work
-    # t = np.expand_dims(np.linspace(lrate,hrate,leng, False), axis=0)
-    # f = np.expand_dims(np.linspace(lfreq,hfreq,numcomp, False), axis=1)
-    #
-    # # fig, axs = plt.subplots(1, len(Rate) + 1,squeeze=False)
-    # # im_extent=[0,np.max(t),0,np.max(f)]
-    # y_sum = np.zeros((t + f).shape)
-    #
-    # import pdb
-    # pdb.set_trace()
-    #
-    # for i, (vel,phi,amp,scl) in enumerate(zip(Rate,Phase,Amplitude,Scales)):
-    #     y = (amp) * (np.sin(vel * t + scl * f + phi))
-    #
-    #     y_sum += y
-
-    #     axs[0, i].imshow(y, aspect='auto', origin='lower', extent=im_extent)
-    #     if (TorcFreq < np.max(frqs)) or (i > 0):
-    #         axs[0,i].get_xaxis().set_visible(False)
-    #     else:
-    #         axs[0, i].tick_params(labelsize=6)
-    #     axs[0, i].set_yticks([])
-    #     if i==0:
-    #         axs[0, i].set_ylabel("{:.1f} cyc/oct".format(scl), fontsize=6)
-    #
-    #     #plot the summed TORC
-    # axs[0, i+1].imshow(y_sum, aspect='auto', origin='lower', extent=im_extent)
-    # axs[0, i+1].get_xaxis().set_visible(False)
-    # axs[0, i+1].get_yaxis().set_visible(False)
-    #
-    # fig1, axs1 = plt.subplots()
-    # axs1.imshow(y_sum, aspect='auto', origin='lower', extent=im_extent)
-
-    # return y_sum
-############################
-
+    [u,s,v] = np.linalg.svd(strfsmooth)
+    axs[2].set_xlim(0,u.shape[0])
+    axs[2].set_xticks(np.linspace(0,u.shape[0],6))
+    axs[2].set_xticklabels(freqticks)
+    axs[2].plot(ndi.filters.gaussian_filter(u[:,0],5))
+    axs[2].set_title('Frequency Tuning',fontweight='bold')
+    axs[2].set_xlabel('Frequency (Hz)')
+    axs[2].set_ylabel('Gain (a.u.)')
