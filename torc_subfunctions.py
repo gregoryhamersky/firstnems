@@ -140,7 +140,7 @@ def strfplot(strf0, lfreq, tleng, smooth=0, noct=5, siglev=5,axs=None):
                 freqticks.append(freqappend)
             axs.set_yticks(np.arange(noct))
             axs.set_yticklabels(freqticks)
-    return freqticks
+    return freqticks,strfdata
 
 
 def strf_torc_pred(stim, strfest):
@@ -160,7 +160,6 @@ def strf_torc_pred(stim, strfest):
             pred[:, rec] = pred[:, rec] + tr
 
     return pred
-
 
 
 def makepsth(dsum,fhist,startime,endtime,mf=1):

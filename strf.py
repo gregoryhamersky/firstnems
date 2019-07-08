@@ -9,16 +9,25 @@ import numpy as np
 from scipy import ndimage as ndi
 from scipy import signal as sgn
 import scipy.io as sio
+import collections
 
-from tor_subfunctions import interpft, strfplot, strf_torc_pred, strf_est_core
+from torc_subfunctions import interpft, strfplot, strf_torc_pred, strf_est_core
 
-####Sample Data- works#####
-mfilename = "/auto/data/daq/Amanita/AMT005/AMT005c05_p_TOR.m"
-cellid = 'AMT005c-12-1' #one being used in Matlab
-fs=1000
+####Sample Data- works as test#####
+# mfilename = "/auto/data/daq/Amanita/AMT005/AMT005c05_p_TOR.m"
+# cellid = 'AMT005c-12-1' #one being used in Matlab
+# fs=1000
 ###########################
 
-def tor_tuning(mfilename,cellid,fs):
+def tor_tuning(mfilename,cellid,fs=1000,plot=False):
+    '''
+    Creates STRF from stimulus and response
+    :param mfilename: File with your data in it
+    :param cellid: Name of cell
+    :param fs: sampling frequency, default 1000
+    :param plot: If True, makes a nice plot of your data
+    :return: named tuple with important data that would be found in plot (strf, bestfreq, snr, onset/offset latency)
+    '''
     rec = nb.baphy_load_recording_file(mfilename=mfilename, cellid=cellid,fs=fs, stim=False) #fs=1000
     globalparams, exptparams, exptevents = nio.baphy_parm_read(mfilename)
     signal = rec['resp'].rasterize(fs=fs)                                                         #rasterize the signal
@@ -152,7 +161,7 @@ def tor_tuning(mfilename,cellid,fs):
         dd = np.concatenate([np.diff(sigmod),[41]])
         durbin = sigmod[np.min((dd[0:] > 40).ravel().nonzero())]
         lat = int(np.round(latbin * 1000 / fs))
-        offlat = (np.round(durbin * 1000 / fs))
+        offlat = int(np.round(durbin * 1000 / fs))
         print("onset/offset latency:", lat, offlat)
     else:
         latbin = 0
@@ -161,48 +170,54 @@ def tor_tuning(mfilename,cellid,fs):
         offlat = 0
         print('no significant onset latency\n')
 
+
     #####Time to plot#####
-    fig,axs = plt.subplots(1,3)
+    if plot:
+        fig,axs = plt.subplots(1,3)
 
-    freqticks = strfplot(strf0, StimParams['lfreq'], StimParams['basep'], 1, StimParams['octaves'], axs=axs[0])
+        [freqticks,strfdatasmooth] = strfplot(strf0, StimParams['lfreq'], StimParams['basep'], 1, StimParams['octaves'], axs=axs[0])
 
-    aa = plt.axis()
+        aa = plt.axis()
 
-    [ylow,yhigh] = axs[0].get_ylim()
-    [xlow,xhigh] = axs[0].get_xlim()
+        [ylow,yhigh] = axs[0].get_ylim()
+        [xlow,xhigh] = axs[0].get_xlim()
 
-    ydiff = yhigh - ylow
-    ym = ylow + ydiff/2
-    ybf = ym - shiftbins / strf0.shape[0] * ydiff
-    axs[0].hlines(ybf,0,xhigh,linestyle='dashed')
-    axs[0].vlines(latbin,0,yhigh,linestyle='dashed')
-    axs[0].vlines(durbin,0,yhigh,linestyle='dashed')
-    axs[0].set_title('%s - BF %d Hz' % (os.path.basename(mfilename),bf),fontweight='bold')
-    axs[0].set_xlabel('SNR %.2f linxc %.2f' % (snr,linpred))
+        ydiff = yhigh - ylow
+        ym = ylow + ydiff/2
+        ybf = ym - shiftbins / strf0.shape[0] * ydiff
+        axs[0].hlines(ybf,0,xhigh,linestyle='dashed')
+        axs[0].vlines(latbin,0,yhigh,linestyle='dashed')
+        axs[0].vlines(durbin,0,yhigh,linestyle='dashed')
+        axs[0].set_title('%s - BF %d Hz' % (os.path.basename(mfilename),bf),fontweight='bold')
+        axs[0].set_xlabel('SNR %.2f linxc %.2f' % (snr,linpred))
 
-    #move to next subplot
+        #move to next subplot
 
-    axs[1].set_ylim(np.min(irsmooth),np.max(irsmooth))
-    axs[1].set_xlim(0,len(irsmooth))
-    #axs[1].axis([np.min(irsmooth),np.max(irsmooth),0,len(irsmooth)])
-    # irsmoothrs = np.expand_dims(irsmooth,axis=0)
-    # irempsmoothrs = np.expand_dims(irempsmooth,axis=0)
-    if np.all(strfempsmooth[:] == 0):
-        axs[1].plot(irsmooth)
-    else:
-        axs[1].errorbar(range(len(irsmooth)),irsmooth,irempsmooth,alpha=0.3)
-    axs[1].hlines(mb,0,len(irsmooth),linestyle='dashed')
-    axs[1].vlines(latbin,0,(np.max(irsmooth)+np.max(irempsmooth)),linestyle='dashed')
-    axs[1].vlines(durbin,0,(np.max(irsmooth)+np.max(irempsmooth)),linestyle='dashed')
-    axs[1].set_title('On/Off Lat %d/%d ms' % (lat, offlat),fontweight='bold')
+        axs[1].set_ylim(np.min(irsmooth),np.max(irsmooth))
+        axs[1].set_xlim(0,len(irsmooth))
+        #axs[1].axis([np.min(irsmooth),np.max(irsmooth),0,len(irsmooth)])
+        # irsmoothrs = np.expand_dims(irsmooth,axis=0)
+        # irempsmoothrs = np.expand_dims(irempsmooth,axis=0)
+        if np.all(strfempsmooth[:] == 0):
+            axs[1].plot(irsmooth)
+        else:
+            axs[1].errorbar(range(len(irsmooth)),irsmooth,irempsmooth,alpha=0.3)
+        axs[1].hlines(mb,0,len(irsmooth),linestyle='dashed')
+        axs[1].vlines(latbin,0,(np.max(irsmooth)+np.max(irempsmooth)),linestyle='dashed')
+        axs[1].vlines(durbin,0,(np.max(irsmooth)+np.max(irempsmooth)),linestyle='dashed')
+        axs[1].set_title('On/Off Lat %d/%d ms' % (lat, offlat),fontweight='bold')
 
-    #move to next subplot
+        #move to next subplot
 
-    [u,s,v] = np.linalg.svd(strfsmooth)
-    axs[2].set_xlim(0,u.shape[0])
-    axs[2].set_xticks(np.linspace(0,u.shape[0],6))
-    axs[2].set_xticklabels(freqticks)
-    axs[2].plot(ndi.filters.gaussian_filter(u[:,0],5))
-    axs[2].set_title('Frequency Tuning',fontweight='bold')
-    axs[2].set_xlabel('Frequency (Hz)')
-    axs[2].set_ylabel('Gain (a.u.)')
+        [u,s,v] = np.linalg.svd(strfsmooth)
+        axs[2].set_xlim(0,u.shape[0])
+        axs[2].set_xticks(np.linspace(0,u.shape[0],6))
+        axs[2].set_xticklabels(freqticks)
+        axs[2].plot(ndi.filters.gaussian_filter(u[:,0],5))
+        axs[2].set_title('Frequency Tuning',fontweight='bold')
+        axs[2].set_xlabel('Frequency (Hz)')
+        axs[2].set_ylabel('Gain (a.u.)')
+
+    tor_tuning_output = collections.namedtuple('STRF_Data',['STRF','Best_Frequency_Hz','Signal_to_Noise','Onset_Latency_ms','Offset_Latency_ms'])
+
+    return tor_tuning_output(strf0, bf, snr, lat, offlat)
