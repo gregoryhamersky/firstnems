@@ -11,7 +11,7 @@ from scipy import signal as sgn
 import scipy.io as sio
 import collections
 
-from torc_subfunctions import interpft, strfplot, strf_torc_pred, strf_est_core
+from nems_lbhb.strf.torc_subfunctions import interpft, strfplot, strf_torc_pred, strf_est_core
 
 ####Sample Data- works as test#####
 # mfilename = "/auto/data/daq/Amanita/AMT005/AMT005c05_p_TOR.m"
@@ -66,13 +66,13 @@ def tor_tuning(mfilename,cellid,fs=1000,plot=False):
     [stimX,stimT,numrecs] = stim.shape
     basep = StimParams['basep']
 
-    ##
-    rmat = sio.loadmat('/auto/users/hamersky/r.mat')
-    rmat = rmat['r']
+    # ##
+    # rmat = sio.loadmat('/auto/users/hamersky/r.mat')
+    # rmat = rmat['r']
+    #
+    # ##
 
-    ##
-
-    stackeduse = rmat[FirstStimTime:,:,:]
+    stackeduse = stacked[FirstStimTime:,:,:]
     cyclesperrep = int(stackeduse.shape[0] / basep)
     totalreps = numreps * cyclesperrep
 
